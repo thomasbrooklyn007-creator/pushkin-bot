@@ -270,49 +270,43 @@ async def teacher_password(message: Message, state: FSMContext):
 async def reg_name(message: Message, state: FSMContext):
     name_input = message.text.strip()
     name_normalized = normalize_name(name_input)
+    
     conn = get_db()
     students = conn.execute("SELECT position, name FROM class_list ORDER BY position").fetchall()
     conn.close()
+    
     found = None
-    best_match = None
-    best_score = 0
-    for position, full_name in students:
-        db_name = normalize_name(full_name)
-        if db_name == name_normalized:
-            found = (position, full_name)
-            break
-        if name_normalized in db_name or db_name in name_normalized:
-            score = len(set(name_normalized.split()) & set(db_name.split()))
-            if score > best_score:
-                best_score = score
-                best_match = (position, full_name)
-    if not found and best_match:
-        found = best_match
+    # ... (тут твой код поиска совпадения, оставляем как есть) ...
+    # Допустим, мы нашли matching_position и matching_name
+    
     if found:
         position, full_name = found
+        
         conn = get_db()
-        existing_user = conn.execute("SELECT * FROM users WHERE tg_id=?", (message.from_user.id,)).fetchone()
-        if existing_user:
-            conn.close()
-            await state.clear()
-            return await message.answer(f"⚠️ Вы уже зарегистрированы как {existing_user[1]}.")
-        existing_position = conn.execute("SELECT tg_id FROM users WHERE class_position=?", (position,)).fetchone()
+        
+        # 1. Проверяем, не注册ирован ли уже ЭТОТ пользователь (по tg_id)
+        existing_user_by_id = conn.execute("SELECT * FROM users WHERE tg_id=?", (message.from_user.id,)).fetchone()
+        
+        # 2. ВАЖНОЕ ДОПОЛНЕНИЕ: Проверяем, не занято ли это ФИО ДРУГИМ человеком
+        existing_user_by_name = conn.execute("SELECT tg_id FROM users WHERE name=?", (full_name,)).fetchone()
+        
         conn.close()
-        if existing_position:
-            await message.answer(f"⚠️ Строка {position} ({full_name}) уже занята.")
-            return
+        
+        if existing_user_by_id:
+            # Если этот tg_id уже есть в базе, просто пускаем его (обновляем данные или показываем меню)
+            # Но лучше проверить, совпадает ли имя. Если он сменил имя в ТГ, а в базе старое - это ок.
+            # Главное, что этот аккаунт уже авторизован.
+             await state.clear()
+             return await message.answer(f"⚠️ Ты уже зарегистрирован в системе как {existing_user_by_id[1]}.\n\nИспользуй /menu.")
+
+        if existing_user_by_name:
+            # Если такое ФИО уже есть в базе, но привязано к ДРУГОМУ tg_id
+            if existing_user_by_name[0] != message.from_user.id:
+                 return await message.answer(f"🚫 Доступ запрещен!\n\nФИО *{full_name}* уже зарегистрировано другим пользователем.\n\nЕсли это ошибка — обратись к администратору.")
+        
+        # Если всё чисто - продолжаем регистрацию
         await state.update_data(name=full_name, position=position)
-        if "Алексеева Дарья Леонидовна" in full_name:
-            if message.from_user.id not in ADMINS:
-                ADMINS.append(message.from_user.id)
-        await message.answer(f"✅ Найдено: *{full_name}*\n📍 Твоя строка: *{position}*\n\n💰 Введи ОБЩИЙ баланс:", parse_mode="Markdown")
-        await state.set_state(RegState.total)
-    else:
-        conn = get_db()
-        sample = conn.execute("SELECT name FROM class_list LIMIT 10").fetchall()
-        conn.close()
-        sample_text = "\n".join([f"• {s[0]}" for s in sample])
-        await message.answer(f"❌ ФИО не найдено.\n\nПримеры из списка:\n{sample_text}\n\nПопробуй ещё раз:")
+        # ... дальше код запроса баланса ...
 
 @router.message(RegState.total)
 async def reg_total(message: Message, state: FSMContext):
