@@ -1,9 +1,9 @@
-import os
 import asyncio
 import logging
 import sqlite3
 from datetime import datetime, timedelta
 from io import BytesIO
+import os
 
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.filters import Command, StateFilter
@@ -12,16 +12,19 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery, BufferedInputFile
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
 import openpyxl
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 from openpyxl.utils import get_column_letter
 
-TOKEN = os.environ.get("BOT_TOKEN")
+# ===== НАСТРОЙКИ =====
+TOKEN = os.environ.get("BOT_TOKEN", "9025997763:AAFF_6hSgwzjk0NrLko3-xZNiBOVNtofYHc")
 OWNER_ID = int(os.environ.get("OWNER_ID", "1739585715"))
 
 CLASS_NAME = "10И"
 CLASS_TEACHER = "Семёнова Ольга Забировна"
 TEACHER_PASSWORD = "новый год"
+GLOBAL_PASSWORD = "10и"  # ОБЩИЙ ПАРОЛЬ ДЛЯ ВСЕХ (можешь поменять)
 
 CLASS_LIST = [
     "Акимова Ксения Владимировна",
@@ -101,8 +104,10 @@ def get_db():
 
 def log_action(tg_id, name, action):
     conn = get_db()
+    # Используем московское время для логов
+    moscow_time = datetime.now() + timedelta(hours=3)
     conn.execute("INSERT INTO logs (tg_id, name, action, timestamp) VALUES (?, ?, ?, ?)",
-                 (tg_id, name, action, datetime.now().strftime('%d.%m.%Y %H:%M:%S')))
+                 (tg_id, name, action, moscow_time.strftime('%d.%m.%Y %H:%M:%S')))
     conn.commit()
     conn.close()
 
@@ -110,7 +115,7 @@ def is_admin(user_id):
     return user_id in ADMINS
 
 def get_week_dates_keyboard():
-    today = datetime.now()
+    today = datetime.now() + timedelta(hours=3) # Учитываем смещение для дат
     monday = today - timedelta(days=today.weekday())
     sunday = monday + timedelta(days=6)
     dates = []
@@ -137,6 +142,9 @@ def back_with_cancel(callback_data):
         [InlineKeyboardButton(text="⬅️ Назад", callback_data=callback_data),
          InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_add")]
     ])
+
+class GlobalPasswordState(StatesGroup):
+    password = State()
 
 class RoleState(StatesGroup):
     role = State()
@@ -172,23 +180,50 @@ class BroadcastState(StatesGroup):
 @router.message(Command("start"), StateFilter("*"))
 async def cmd_start(message: Message, state: FSMContext):
     await state.clear()
+    
     conn = get_db()
     user = conn.execute("SELECT * FROM users WHERE tg_id=?", (message.from_user.id,)).fetchone()
     teacher = conn.execute("SELECT * FROM teachers WHERE tg_id=?", (message.from_user.id,)).fetchone()
     conn.close()
-    if user:
-        log_action(message.from_user.id, user[1], "Вход в бота")
-        await show_menu(message)
-    elif teacher:
-        log_action(message.from_user.id, teacher[1], "Вход учителя")
-        await show_teacher_menu(message)
+    
+    if user or teacher:
+        # Если уже зарегистрирован - пускаем сразу
+        if user:
+            log_action(message.from_user.id, user[1], "Вход в бота")
+            await show_menu(message)
+        else:
+            log_action(message.from_user.id, teacher[1], "Вход учителя")
+            await show_teacher_menu(message)
     else:
+        # Если новый - просим общий пароль
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🎓 Я ученик", callback_data="role_student")],
-            [InlineKeyboardButton(text="👨‍🏫 Я учитель", callback_data="role_teacher")],
+            [InlineKeyboardButton(text="🔐 Войти в систему", callback_data="enter_global_pass")]
         ])
-        await message.answer("👋 Привет! Я бот для учёта Пушкинской карты (10И класс).\n\nВыбери свою роль:", reply_markup=kb)
-        await state.set_state(RoleState.role)
+        await message.answer(
+            f"👋 Привет! Это закрытый бот для учёта Пушкинской карты ({CLASS_NAME} класс).\n\n"
+            f"Для доступа введи общий пароль класса:",
+            reply_markup=kb
+        )
+        await state.set_state(GlobalPasswordState.password)
+
+@router.callback_query(F.data == "enter_global_pass")
+async def ask_global_pass(cb: CallbackQuery, state: FSMContext):
+    await cb.message.answer("🔑 Введи пароль:")
+    await state.set_state(GlobalPasswordState.password)
+    await cb.answer()
+
+@router.message(GlobalPasswordState.password)
+async def check_global_password(message: Message, state: FSMContext):
+    if message.text.strip().lower() != GLOBAL_PASSWORD.lower():
+        return await message.answer("❌ Неверный пароль. Доступ запрещен.")
+    
+    await state.update_data(global_pass_ok=True)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🎓 Я ученик", callback_data="role_student")],
+        [InlineKeyboardButton(text="👨‍🏫 Я учитель", callback_data="role_teacher")],
+    ])
+    await message.answer("✅ Пароль верен!\n\nВыбери свою роль:", reply_markup=kb)
+    await state.set_state(RoleState.role)
 
 @router.callback_query(F.data == "role_student")
 async def role_student(cb: CallbackQuery, state: FSMContext):
@@ -218,7 +253,7 @@ async def back_to_role(cb: CallbackQuery, state: FSMContext):
 @router.message(TeacherPasswordState.password)
 async def teacher_password(message: Message, state: FSMContext):
     if message.text.strip().lower() != TEACHER_PASSWORD.lower():
-        return await message.answer("❌ Неверный пароль. Попробуй ещё раз.")
+        return await message.answer("❌ Неверный пароль учителя.")
     conn = get_db()
     existing = conn.execute("SELECT * FROM teachers WHERE tg_id=?", (message.from_user.id,)).fetchone()
     if existing:
@@ -263,34 +298,33 @@ async def reg_name(message: Message, state: FSMContext):
         if existing_user:
             conn.close()
             await state.clear()
-            return await message.answer(f"⚠️ Вы уже зарегистрированы как {existing_user[1]}.\n\nЕсли это ошибка — напишите администратору.")
+            return await message.answer(f"⚠️ Вы уже зарегистрированы как {existing_user[1]}.")
         existing_position = conn.execute("SELECT tg_id FROM users WHERE class_position=?", (position,)).fetchone()
         conn.close()
         if existing_position:
-            await message.answer(f"⚠️ Строка {position} ({full_name}) уже занята другим аккаунтом.\n\nЕсли это вы — напишите администратору.")
+            await message.answer(f"⚠️ Строка {position} ({full_name}) уже занята.")
             return
         await state.update_data(name=full_name, position=position)
         if "Алексеева Дарья Леонидовна" in full_name:
             if message.from_user.id not in ADMINS:
                 ADMINS.append(message.from_user.id)
-            print(f"✅ {full_name} добавлена в админы")
-        await message.answer(f"✅ Найдено: *{full_name}*\n📍 Твоя строка в таблице: *{position}*\n\n💰 Введи ОБЩИЙ баланс (например, 2800):", parse_mode="Markdown")
+        await message.answer(f"✅ Найдено: *{full_name}*\n📍 Твоя строка: *{position}*\n\n💰 Введи ОБЩИЙ баланс:", parse_mode="Markdown")
         await state.set_state(RegState.total)
     else:
         conn = get_db()
         sample = conn.execute("SELECT name FROM class_list LIMIT 10").fetchall()
         conn.close()
         sample_text = "\n".join([f"• {s[0]}" for s in sample])
-        await message.answer(f"❌ ФИО \"{name_input}\" не найдено.\n\nВот как выглядят имена в списке:\n{sample_text}\n\nНапиши своё ФИО ещё раз:")
+        await message.answer(f"❌ ФИО не найдено.\n\nПримеры из списка:\n{sample_text}\n\nПопробуй ещё раз:")
 
 @router.message(RegState.total)
 async def reg_total(message: Message, state: FSMContext):
     try:
         total = float(message.text.replace(',', '.'))
     except:
-        return await message.answer("❌ Введи число, например 2800")
+        return await message.answer("❌ Введи число")
     await state.update_data(total=total)
-    await message.answer(f"✅ Общий баланс: {int(total)}₽\n\n🎬 Сколько из них на КИНО?")
+    await message.answer(f"✅ Общий: {int(total)}₽\n\n🎬 Сколько на КИНО?")
     await state.set_state(RegState.cinema)
 
 @router.message(RegState.cinema)
@@ -303,7 +337,7 @@ async def reg_cinema(message: Message, state: FSMContext):
     total = data['total']
     theater = total - cinema
     if theater < 0:
-        return await message.answer("❌ Баланс на кино больше общего. Проверь данные.")
+        return await message.answer("❌ Баланс на кино больше общего.")
     conn = get_db()
     conn.execute("INSERT INTO users (tg_id, name, total_balance, cinema_balance, theater_balance, class_position) VALUES (?, ?, ?, ?, ?, ?)",
                  (message.from_user.id, data['name'], total, cinema, theater, data['position']))
@@ -311,7 +345,7 @@ async def reg_cinema(message: Message, state: FSMContext):
     conn.close()
     await state.clear()
     log_action(message.from_user.id, data['name'], f"Регистрация (общий: {int(total)}, кино: {int(cinema)}, театр: {int(theater)})")
-    await message.answer(f"✅ Готово, {data['name']}!\n📍 Твоя строка в таблице: {data['position']}\n\n💰 Общий: {int(total)}₽\n🎬 Кино: {int(cinema)}₽\n🎭 Театр: {int(theater)}₽\n\nИспользуй /menu или кнопки ниже 👇")
+    await message.answer(f"✅ Готово, {data['name']}!\n📍 Строка: {data['position']}\n\n💰 Общий: {int(total)}₽\n🎬 Кино: {int(cinema)}₽\n🎭 Театр: {int(theater)}₽\n\nИспользуй /menu")
     await show_menu(message)
 
 async def show_menu(message: Message):
@@ -386,7 +420,7 @@ async def get_balance_text(tg_id):
     _, name, total, cinema, theater, position = user
     spent_cinema = sum(p for t, p in spent if t == 'кино') or 0
     spent_theater = sum(p for t, p in spent if t == 'театр') or 0
-    return (f"💰 *Пушкинская карта — {name}*\n📍 Строка в таблице: {position}\n\n"
+    return (f"💰 *Пушкинская карта — {name}*\n📍 Строка: {position}\n\n"
             f"🎬 Кино: {int(cinema - spent_cinema)}₽\n🎭 Театр: {int(theater - spent_theater)}₽\n\n"
             f"📊 Потрачено: {int(spent_cinema + spent_theater)}₽")
 
@@ -409,50 +443,38 @@ async def back_to_menu(cb: CallbackQuery, state: FSMContext):
     teacher = conn.execute("SELECT * FROM teachers WHERE tg_id=?", (cb.from_user.id,)).fetchone()
     user = conn.execute("SELECT * FROM users WHERE tg_id=?", (cb.from_user.id,)).fetchone()
     conn.close()
-    try:
-        await cb.message.delete()
-    except:
-        pass
-    if teacher:
-        await show_teacher_menu_direct(cb.from_user.id)
-    elif user:
-        await show_menu_direct(cb.from_user.id)
-    else:
-        await bot.send_message(cb.from_user.id, "❌ Сначала зарегистрируйтесь через /start")
+    try: await cb.message.delete()
+    except: pass
+    if teacher: await show_teacher_menu_direct(cb.from_user.id)
+    elif user: await show_menu_direct(cb.from_user.id)
+    else: await bot.send_message(cb.from_user.id, "❌ Сначала /start")
 
 @router.callback_query(F.data == "back_to_menu_from_admin")
 async def back_to_menu_from_admin(cb: CallbackQuery, state: FSMContext):
     await state.clear()
     await cb.answer()
-    try:
-        await cb.message.delete()
-    except:
-        pass
+    try: await cb.message.delete()
+    except: pass
     conn = get_db()
     teacher = conn.execute("SELECT * FROM teachers WHERE tg_id=?", (cb.from_user.id,)).fetchone()
     user = conn.execute("SELECT * FROM users WHERE tg_id=?", (cb.from_user.id,)).fetchone()
     conn.close()
-    if teacher:
-        await show_teacher_menu_direct(cb.from_user.id)
-    elif user:
-        await show_menu_direct(cb.from_user.id)
-    else:
-        await bot.send_message(cb.from_user.id, "❌ Сначала зарегистрируйтесь через /start")
+    if teacher: await show_teacher_menu_direct(cb.from_user.id)
+    elif user: await show_menu_direct(cb.from_user.id)
+    else: await bot.send_message(cb.from_user.id, "❌ Сначала /start")
 
 @router.callback_query(F.data == "edit_balance")
 async def edit_balance_start(cb: CallbackQuery, state: FSMContext):
-    await cb.message.answer("✏️ *Изменение баланса*\n\nВведи НОВЫЙ общий баланс (например, 2800):", parse_mode="Markdown", reply_markup=back_with_cancel("back_to_menu"))
+    await cb.message.answer("✏️ *Изменение баланса*\n\nВведи НОВЫЙ общий баланс:", parse_mode="Markdown", reply_markup=back_with_cancel("back_to_menu"))
     await state.set_state(EditBalanceState.total)
     await cb.answer()
 
 @router.message(EditBalanceState.total)
 async def edit_balance_total(message: Message, state: FSMContext):
-    try:
-        total = float(message.text.replace(',', '.'))
-    except:
-        return await message.answer("❌ Введи число, например 2800")
+    try: total = float(message.text.replace(',', '.'))
+    except: return await message.answer("❌ Введи число")
     await state.update_data(total=total)
-    await message.answer(f"✅ Новый общий баланс: {int(total)}₽\n\n🎬 Сколько из них на КИНО?", reply_markup=back_button("back_to_edit_total"))
+    await message.answer(f"✅ Новый общий: {int(total)}₽\n\n🎬 Сколько на КИНО?", reply_markup=back_button("back_to_edit_total"))
     await state.set_state(EditBalanceState.cinema)
 
 @router.callback_query(F.data == "back_to_edit_total")
@@ -464,15 +486,12 @@ async def back_to_edit_total(cb: CallbackQuery, state: FSMContext):
 
 @router.message(EditBalanceState.cinema)
 async def edit_balance_cinema(message: Message, state: FSMContext):
-    try:
-        cinema = float(message.text.replace(',', '.'))
-    except:
-        return await message.answer("❌ Введи число")
+    try: cinema = float(message.text.replace(',', '.'))
+    except: return await message.answer("❌ Введи число")
     data = await state.get_data()
     total = data['total']
     theater = total - cinema
-    if theater < 0:
-        return await message.answer("❌ Баланс на кино больше общего.")
+    if theater < 0: return await message.answer("❌ Баланс на кино больше общего.")
     conn = get_db()
     conn.execute("UPDATE users SET total_balance=?, cinema_balance=?, theater_balance=? WHERE tg_id=?", (total, cinema, theater, message.from_user.id))
     conn.commit()
@@ -485,7 +504,7 @@ async def edit_balance_cinema(message: Message, state: FSMContext):
 @router.callback_query(F.data == "add_event")
 async def start_add_event(cb: CallbackQuery, state: FSMContext):
     kb = back_with_cancel("back_to_menu")
-    await cb.message.answer("🎟 Введи НАЗВАНИЕ мероприятия (например, Ёлки 11):", reply_markup=kb)
+    await cb.message.answer("🎟 Введи НАЗВАНИЕ мероприятия:", reply_markup=kb)
     await state.set_state(AddEventState.name)
     await cb.answer()
 
@@ -499,7 +518,7 @@ async def cancel_add(cb: CallbackQuery, state: FSMContext):
 async def add_name(message: Message, state: FSMContext):
     await state.update_data(name=message.text)
     kb = back_with_cancel("back_to_name")
-    await message.answer("📍 Введи МЕСТО (например, Синема 5):", reply_markup=kb)
+    await message.answer("📍 Введи МЕСТО:", reply_markup=kb)
     await state.set_state(AddEventState.place)
 
 @router.callback_query(F.data == "back_to_name")
@@ -552,10 +571,8 @@ async def back_to_type(cb: CallbackQuery, state: FSMContext):
 
 @router.message(AddEventState.price)
 async def add_price(message: Message, state: FSMContext):
-    try:
-        price = float(message.text.replace(',', '.'))
-    except:
-        return await message.answer("❌ Введи число")
+    try: price = float(message.text.replace(',', '.'))
+    except: return await message.answer("❌ Введи число")
     await state.update_data(price=price)
     await message.answer("📅 Выбери ДАТУ:", reply_markup=get_week_dates_keyboard())
 
@@ -564,50 +581,26 @@ async def add_date(cb: CallbackQuery, state: FSMContext):
     selected_date = str(cb.data.split("date_")[1])
     await state.update_data(date=selected_date)
     data = await state.get_data()
-    
-    if 'price' not in data:
-        return await cb.message.answer("❌ Ошибка: цена не сохранена.")
-    
+    if 'price' not in data: return await cb.message.answer("❌ Ошибка цены.")
     price = float(data['price'])
-    
     conn = get_db()
-    conn.execute(
-        "INSERT INTO events (tg_id, name, place, event_type, price, date) VALUES (?, ?, ?, ?, ?, ?)",
-        (int(cb.from_user.id), str(data['name']), str(data['place']), str(data['event_type']), price, selected_date)
-    )
+    conn.execute("INSERT INTO events (tg_id, name, place, event_type, price, date) VALUES (?, ?, ?, ?, ?, ?)",
+                 (int(cb.from_user.id), str(data['name']), str(data['place']), str(data['event_type']), price, selected_date))
     conn.commit()
-    
     last_event = conn.execute("SELECT * FROM events ORDER BY id DESC LIMIT 1").fetchone()
-    print(f"✅ Записано в БД: ID={last_event[0]}, TG_ID={last_event[1]}, Name={last_event[2]}, Price={last_event[5]}, Date={last_event[6]}")
-    
+    print(f"✅ Записано в БД: ID={last_event[0]}, Date={last_event[6]}")
     user = conn.execute("SELECT * FROM users WHERE tg_id=?", (cb.from_user.id,)).fetchone()
     spent = conn.execute("SELECT event_type, SUM(price) FROM events WHERE tg_id=? GROUP BY event_type", (cb.from_user.id,)).fetchall()
     conn.close()
-    
     _, name, total, cinema, theater, position = user
     spent_cinema = sum(p for t, p in spent if t == 'кино') or 0
     spent_theater = sum(p for t, p in spent if t == 'театр') or 0
-    
     await state.clear()
-    
     log_action(cb.from_user.id, name, f"Добавление: {data['name']} ({data['event_type']}, {int(price)}₽, {selected_date})")
-    
     icon = "🎬" if data['event_type'] == "кино" else "🎭"
-    
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📱 В главное меню", callback_data="back_to_menu")]])
-    
-    await cb.message.answer(
-        f"✅ Добавлено! Баланс списан.\n\n"
-        f"{icon} *{data['name']}*\n"
-        f"📍 {data['place']}\n"
-        f"💰 {int(price)}₽\n"
-        f"📅 {selected_date}\n\n"
-        f"💰 *Твой баланс:*\n"
-        f"🎬 Кино: {int(cinema - spent_cinema)}₽\n"
-        f"🎭 Театр: {int(theater - spent_theater)}₽",
-        parse_mode="Markdown",
-        reply_markup=kb
-    )
+    await cb.message.answer(f"✅ Добавлено! Баланс списан.\n\n{icon} *{data['name']}*\n📍 {data['place']}\n💰 {int(price)}₽\n📅 {selected_date}\n\n💰 *Твой баланс:*\n🎬 Кино: {int(cinema - spent_cinema)}₽\n🎭 Театр: {int(theater - spent_theater)}₽",
+                            parse_mode="Markdown", reply_markup=kb)
     await cb.answer()
 
 @router.callback_query(F.data == "week_events")
@@ -627,7 +620,7 @@ async def week_events(cb: CallbackQuery):
         icon = "🎬" if etype == "кино" else "🎭"
         text += f"{icon} *{name}*\n📍 {place}\n💰 {int(price)}₽ | 📅 {date}\n\n"
         kb_rows.append([
-            InlineKeyboardButton(text=f"✏️ {name}", callback_data=f"edit_event_{event_id}"),
+            InlineKeyboardButton(text=f"✏️", callback_data=f"edit_event_{event_id}"),
             InlineKeyboardButton(text=f"🗑", callback_data=f"del_event_{event_id}")
         ])
     kb_rows.append([InlineKeyboardButton(text="⬅️ В меню", callback_data="back_to_menu")])
@@ -641,11 +634,10 @@ async def edit_event_start(cb: CallbackQuery, state: FSMContext):
     conn = get_db()
     event = conn.execute("SELECT * FROM events WHERE id=? AND tg_id=?", (event_id, cb.from_user.id)).fetchone()
     conn.close()
-    if not event:
-        return await cb.message.answer("❌ Мероприятие не найдено")
+    if not event: return await cb.message.answer("❌ Не найдено")
     await state.update_data(event_id=event_id, old_name=event[2], old_place=event[3], old_type=event[4], old_price=event[5], old_date=event[6])
     kb = back_with_cancel("back_to_events")
-    await cb.message.answer(f"✏️ *Редактирование: {event[2]}*\n\nТекущее место: {event[3]}\nНовое название (или отправь '-' чтобы оставить):", parse_mode="Markdown", reply_markup=kb)
+    await cb.message.answer(f"✏️ *Редактирование: {event[2]}*\n\nНовое название (или '-' чтобы оставить):", parse_mode="Markdown", reply_markup=kb)
     await state.set_state(EditEventState.name)
     await cb.answer()
 
@@ -660,8 +652,7 @@ async def back_to_events(cb: CallbackQuery, state: FSMContext):
 async def edit_event_name(message: Message, state: FSMContext):
     data = await state.get_data()
     new_name = message.text.strip()
-    if new_name == '-':
-        new_name = data['old_name']
+    if new_name == '-': new_name = data['old_name']
     await state.update_data(name=new_name)
     kb = back_with_cancel("back_to_events")
     await message.answer(f"📍 Новое место (или '-' чтобы оставить {data['old_place']}):", reply_markup=kb)
@@ -671,15 +662,14 @@ async def edit_event_name(message: Message, state: FSMContext):
 async def edit_event_place(message: Message, state: FSMContext):
     data = await state.get_data()
     new_place = message.text.strip()
-    if new_place == '-':
-        new_place = data['old_place']
+    if new_place == '-': new_place = data['old_place']
     await state.update_data(place=new_place)
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🎬 Кино", callback_data="edit_type_cinema")],
         [InlineKeyboardButton(text="🎭 Театр", callback_data="edit_type_theater")],
         [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_to_edit_place")],
     ])
-    await message.answer(f"Выбери тип (или отправь '-' чтобы оставить {data['old_type']}):", reply_markup=kb)
+    await message.answer(f"Выбери тип (или '-' чтобы оставить {data['old_type']}):", reply_markup=kb)
 
 @router.callback_query(F.data == "back_to_edit_place")
 async def back_to_edit_place(cb: CallbackQuery, state: FSMContext):
@@ -702,13 +692,10 @@ async def edit_event_type(cb: CallbackQuery, state: FSMContext):
 async def edit_event_price(message: Message, state: FSMContext):
     data = await state.get_data()
     price_text = message.text.strip()
-    if price_text == '-':
-        new_price = data['old_price']
+    if price_text == '-': new_price = data['old_price']
     else:
-        try:
-            new_price = float(price_text.replace(',', '.'))
-        except:
-            return await message.answer("❌ Введи число или '-'")
+        try: new_price = float(price_text.replace(',', '.'))
+        except: return await message.answer("❌ Введи число или '-'")
     conn = get_db()
     conn.execute("UPDATE events SET name=?, place=?, event_type=?, price=? WHERE id=? AND tg_id=?",
                  (data['name'], data['place'], data['event_type'], new_price, data['event_id'], message.from_user.id))
@@ -732,10 +719,10 @@ async def delete_event(cb: CallbackQuery):
     await cb.answer()
     await week_events(cb)
 
+# ===== АДМИН ПАНЕЛЬ И УДАЛЕНИЕ ПОЛЬЗОВАТЕЛЕЙ =====
 @router.callback_query(F.data == "admin_panel")
 async def admin_panel(cb: CallbackQuery):
-    if not is_admin(cb.from_user.id):
-        return await cb.answer("❌ Нет доступа", show_alert=True)
+    if not is_admin(cb.from_user.id): return await cb.answer("❌ Нет доступа", show_alert=True)
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📋 Посмотреть список класса", callback_data="view_class")],
         [InlineKeyboardButton(text="📊 Получить Excel сейчас", callback_data="export_now")],
@@ -749,8 +736,7 @@ async def admin_panel(cb: CallbackQuery):
 
 @router.callback_query(F.data == "stats")
 async def show_stats(cb: CallbackQuery):
-    if not is_admin(cb.from_user.id):
-        return await cb.answer("❌ Нет доступа", show_alert=True)
+    if not is_admin(cb.from_user.id): return await cb.answer("❌ Нет доступа", show_alert=True)
     conn = get_db()
     total_students = len(CLASS_LIST)
     registered = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
@@ -775,8 +761,7 @@ async def show_stats(cb: CallbackQuery):
 
 @router.callback_query(F.data == "logs")
 async def show_logs(cb: CallbackQuery):
-    if not is_admin(cb.from_user.id):
-        return await cb.answer("❌ Нет доступа", show_alert=True)
+    if not is_admin(cb.from_user.id): return await cb.answer("❌ Нет доступа", show_alert=True)
     conn = get_db()
     logs = conn.execute("SELECT name, action, timestamp FROM logs ORDER BY id DESC LIMIT 50").fetchall()
     conn.close()
@@ -792,8 +777,7 @@ async def show_logs(cb: CallbackQuery):
 
 @router.callback_query(F.data == "view_class")
 async def view_class(cb: CallbackQuery):
-    if not is_admin(cb.from_user.id):
-        return await cb.answer("❌ Нет доступа", show_alert=True)
+    if not is_admin(cb.from_user.id): return await cb.answer("❌ Нет доступа", show_alert=True)
     conn = get_db()
     students = conn.execute("SELECT position, name FROM class_list ORDER BY position").fetchall()
     conn.close()
@@ -806,26 +790,48 @@ async def view_class(cb: CallbackQuery):
 
 @router.callback_query(F.data == "list_users")
 async def list_users(cb: CallbackQuery):
-    if not is_admin(cb.from_user.id):
-        return await cb.answer("❌ Нет доступа", show_alert=True)
+    if not is_admin(cb.from_user.id): return await cb.answer("❌ Нет доступа", show_alert=True)
     conn = get_db()
-    users = conn.execute("SELECT name, class_position FROM users ORDER BY class_position").fetchall()
+    users = conn.execute("SELECT tg_id, name, class_position FROM users ORDER BY class_position").fetchall()
     conn.close()
     if not users:
         kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ В админ-панель", callback_data="admin_panel")]])
         return await cb.message.answer("📭 Пока никто не зарегистрировался", reply_markup=kb)
     text = f"👥 *Зарегистрировано: {len(users)} из {len(CLASS_LIST)}*\n\n"
-    for name, position in users:
+    kb_rows = []
+    for tg_id, name, position in users:
         text += f"✅ {position}. {name}\n"
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ В админ-панель", callback_data="admin_panel")]])
+        kb_rows.append([InlineKeyboardButton(text=f"🗑 Удалить {name.split()[0]}", callback_data=f"del_user_{tg_id}")])
+    kb_rows.append([InlineKeyboardButton(text="⬅️ В админ-панель", callback_data="admin_panel")])
+    kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
     await cb.message.answer(text, parse_mode="Markdown", reply_markup=kb)
+    await cb.answer()
+
+@router.callback_query(F.data.startswith("del_user_"))
+async def delete_user(cb: CallbackQuery):
+    if not is_admin(cb.from_user.id): return await cb.answer("❌ Нет доступа", show_alert=True)
+    user_id_to_delete = int(cb.data.split("del_user_")[1])
+    
+    conn = get_db()
+    user = conn.execute("SELECT name FROM users WHERE tg_id=?", (user_id_to_delete,)).fetchone()
+    if user:
+        conn.execute("DELETE FROM users WHERE tg_id=?", (user_id_to_delete,))
+        conn.execute("DELETE FROM events WHERE tg_id=?", (user_id_to_delete,))
+        conn.commit()
+        log_action(cb.from_user.id, "Админ", f"Удалил пользователя: {user[0]} (ID: {user_id_to_delete})")
+        await cb.message.answer(f"🗑 Пользователь {user[0]} и его мероприятия удалены.")
+    else:
+        await cb.message.answer("❌ Пользователь не найден.")
+    conn.close()
+    
+    # Обновляем список
+    await list_users(cb)
     await cb.answer()
 
 @router.callback_query(F.data == "broadcast")
 async def broadcast_start(cb: CallbackQuery, state: FSMContext):
-    if not is_admin(cb.from_user.id):
-        return await cb.answer("❌ Нет доступа", show_alert=True)
-    await cb.message.answer("📢 *Рассылка всем ученикам*\n\nНапиши текст уведомления. Он будет отправлен всем зарегистрированным ученикам.\n\nПример:\n_Идём с классом в кино 29.11 на Мстители: Финал!_\n_Вот ссылка: https://..._",
+    if not is_admin(cb.from_user.id): return await cb.answer("❌ Нет доступа", show_alert=True)
+    await cb.message.answer("📢 *Рассылка всем ученикам*\n\nНапиши текст уведомления:",
                             parse_mode="Markdown", reply_markup=back_with_cancel("back_to_menu"))
     await state.set_state(BroadcastState.message)
     await cb.answer()
@@ -838,7 +844,7 @@ async def broadcast_send(message: Message, state: FSMContext):
     conn.close()
     if not users:
         await state.clear()
-        return await message.answer("📭 Нет зарегистрированных учеников для рассылки.")
+        return await message.answer("📭 Нет учеников.")
     sent = 0
     failed = 0
     for tg_id, name in users:
@@ -847,17 +853,14 @@ async def broadcast_send(message: Message, state: FSMContext):
             sent += 1
         except Exception as e:
             failed += 1
-            print(f"❌ Не удалось отправить {name} (ID {tg_id}): {e}")
     await state.clear()
     log_action(message.from_user.id, "Учитель", f"Рассылка: {text[:50]}...")
-    await message.answer(f"✅ Рассылка завершена!\n\n📤 Отправлено: {sent}\n❌ Ошибок: {failed}\n👥 Всего: {len(users)}")
+    await message.answer(f"✅ Рассылка завершена!\n\n📤 Отправлено: {sent}\n❌ Ошибок: {failed}")
     conn = get_db()
     teacher = conn.execute("SELECT * FROM teachers WHERE tg_id=?", (message.from_user.id,)).fetchone()
     conn.close()
-    if teacher:
-        await show_teacher_menu(message)
-    else:
-        await show_menu(message)
+    if teacher: await show_teacher_menu(message)
+    else: await show_menu(message)
 
 def create_excel_report():
     conn = get_db()
@@ -865,16 +868,6 @@ def create_excel_report():
     users = conn.execute("SELECT * FROM users").fetchall()
     events = conn.execute("SELECT * FROM events ORDER BY date").fetchall()
     conn.close()
-    
-    # ОТЛАДКА
-    print(f"\n{'='*60}")
-    print(f"ОТЛАДКА EXCEL: пользователей={len(users)}, мероприятий={len(events)}")
-    for u in users:
-        print(f"  USER: tg_id={u[0]}, name={u[1]}, pos={u[5]}")
-    for e in events:
-        # ВАЖНО: e[5]=price, e[6]=date!
-        print(f"  EVENT: id={e[0]}, tg_id={e[1]}, name={e[2]}, price={e[5]}, date='{e[6]}'")
-    print(f"{'='*60}\n")
     
     wb = openpyxl.Workbook()
     ws = wb.active
@@ -890,7 +883,7 @@ def create_excel_report():
     ws['A1'] = f"{CLASS_NAME} КЛАСС"
     ws['A1'].font = Font(bold=True, size=14)
     ws['A1'].border = thin_border
-    today = datetime.now()
+    today = datetime.now() + timedelta(hours=3) # Московское время
     ws['B1'] = today.strftime('%d.%m.%Y')
     ws['B1'].font = Font(bold=True, size=11)
     ws['B1'].border = thin_border
@@ -968,14 +961,8 @@ def create_excel_report():
             total = user[2]
             cinema = user[3]
             theater = user[4]
-            pos = user[5]
             
             user_events = [e for e in events if int(e[1]) == tg_id_int]
-            
-            print(f"\n👤 {name} (tg_id={tg_id_int}, pos={pos_int})")
-            print(f"   Найдено мероприятий: {len(user_events)}")
-            for e in user_events:
-                print(f"   - {e[2]} на '{e[6]}' (price={e[5]})")
             
             spent_c = sum(e[4] for e in user_events if e[3] == 'кино') or 0
             spent_t = sum(e[4] for e in user_events if e[3] == 'театр') or 0
@@ -988,14 +975,14 @@ def create_excel_report():
                     date_str = date.strftime('%d.%m')
                     date_events = []
                     for e in user_events:
-                        event_date = str(e[6])  # ВАЖНО: e[6] это date, не e[5]!
+                        event_date = str(e[6])
                         if event_date == date_str or event_date.startswith(date_str + '.') or date_str in event_date:
                             date_events.append(e)
                     
                     if date_events:
+                        # e[2]=name, e[3]=place, e[5]=price
                         event_text = "\n".join([f"{e[2]}\n{e[3]}\n{int(e[5])}₽" for e in date_events])
                         ws.cell(row=row, column=col, value=event_text)
-                        print(f"   ✅ ЗАПИСАНО в Excel на {date_str}: {event_text}")
                     
                     ws.cell(row=row, column=col).alignment = Alignment(wrap_text=True, vertical='top')
                     ws.cell(row=row, column=col).border = thin_border
@@ -1044,17 +1031,16 @@ def create_excel_report():
 
 @router.callback_query(F.data == "export_now")
 async def export_now(cb: CallbackQuery):
-    if not is_admin(cb.from_user.id):
-        return await cb.answer("❌ Нет доступа", show_alert=True)
+    if not is_admin(cb.from_user.id): return await cb.answer("❌ Нет доступа", show_alert=True)
     await cb.answer("⏳ Формирую отчёт...")
     excel_buffer = create_excel_report()
     filename = f"pushkin_{CLASS_NAME}_{datetime.now().strftime('%d%m%Y')}.xlsx"
     excel_file = BufferedInputFile(file=excel_buffer.read(), filename=filename)
     log_action(cb.from_user.id, "Админ", "Экспорт Excel")
-    await cb.message.answer_document(document=excel_file, caption=f"📊 Отчёт {CLASS_NAME} класс — Пушкинская карта\n📅 {datetime.now().strftime('%d.%m.%Y')}")
+    await cb.message.answer_document(document=excel_file, caption=f"📊 Отчёт {CLASS_NAME} класс\n📅 {datetime.now().strftime('%d.%m.%Y')}")
 
 async def send_weekly_report():
-    today_str = datetime.now().strftime('%d.%m.%Y')
+    today_str = (datetime.now() + timedelta(hours=3)).strftime('%d.%m.%Y')
     print(f"📤 Рассылка отчёта за {today_str}")
     for admin_id in ADMINS:
         try:
@@ -1062,7 +1048,7 @@ async def send_weekly_report():
             filename = f"pushkin_{CLASS_NAME}_{datetime.now().strftime('%d%m%Y')}.xlsx"
             excel_file = BufferedInputFile(file=excel_buffer.read(), filename=filename)
             await bot.send_document(chat_id=admin_id, document=excel_file,
-                                    caption=f"📊 *Еженедельный отчёт — {CLASS_NAME} класс*\n📅 Дата: {today_str}\n👨‍🏫 Классный руководитель: {CLASS_TEACHER}\n\nФайл во вложении 👆",
+                                    caption=f"📊 *Еженедельный отчёт — {CLASS_NAME} класс*\n📅 Дата: {today_str}\n👨‍🏫 {CLASS_TEACHER}\n\nФайл во вложении 👆",
                                     parse_mode="Markdown")
             print(f"✅ Отчёт отправлен админу {admin_id}")
         except Exception as e:
@@ -1070,30 +1056,28 @@ async def send_weekly_report():
 
 @router.message(Command("add_admin"))
 async def add_admin(message: Message):
-    if message.from_user.id != OWNER_ID:
-        return await message.answer("❌ Только создатель бота может добавлять админов")
+    if message.from_user.id != OWNER_ID: return await message.answer("❌ Только создатель")
     if message.reply_to_message:
         new_admin_id = message.reply_to_message.from_user.id
-        if new_admin_id not in ADMINS:
-            ADMINS.append(new_admin_id)
-        await message.answer(f"✅ Пользователь ID {new_admin_id} добавлен в админы")
+        if new_admin_id not in ADMINS: ADMINS.append(new_admin_id)
+        await message.answer(f"✅ ID {new_admin_id} добавлен в админы")
     else:
         await message.answer("👉 Ответь на сообщение пользователя командой /add_admin")
 
 @router.message(Command("help"), StateFilter("*"))
 async def cmd_help(message: Message):
-    await message.answer(f"📖 *Команды бота ({CLASS_NAME} класс):*\n\n/start — регистрация / меню\n/menu — главное меню\n/balance — мой баланс\n/help — эта справка\n\nАдмин:\n/add_admin — добавить админа (ответом на сообщение)", parse_mode="Markdown")
+    await message.answer(f"📖 *Команды бота ({CLASS_NAME} класс):*\n\n/start — регистрация / меню\n/menu — главное меню\n/balance — мой баланс\n/help — справка\n\nАдмин:\n/add_admin — добавить админа", parse_mode="Markdown")
 
 async def main():
     logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-    scheduler = AsyncIOScheduler()
-    scheduler.add_job(send_weekly_report, 'cron', day_of_week='mon', hour=7, minute=0, timezone='Europe/Moscow')
+    scheduler = AsyncIOScheduler(timezone='Europe/Moscow')
+    # Запускаем рассылку в понедельник в 7:00 по Москве
+    scheduler.add_job(send_weekly_report, CronTrigger(day_of_week='mon', hour=7, minute=0))
     scheduler.start()
     print(f"✅ Планировщик запущен (понедельник 7:00 МСК)")
     print(f"📚 Класс: {CLASS_NAME}, учитель: {CLASS_TEACHER}")
     print(f"👥 Учеников в списке: {len(CLASS_LIST)}")
     print(f"👨‍🏫 Админы: {ADMINS}")
-    print(f"🔐 Пароль учителя: {TEACHER_PASSWORD}")
     print("🤖 Бот запущен! Открой t.me/PushkinTracker_bot")
     await dp.start_polling(bot)
 
