@@ -24,7 +24,7 @@ OWNER_ID = int(os.environ.get("OWNER_ID", "1739585715"))
 CLASS_NAME = "10И"
 CLASS_TEACHER = "Семёнова Ольга Забировна"
 TEACHER_PASSWORD = "новый год"
-GLOBAL_PASSWORD = "10и"  # ОБЩИЙ ПАРОЛЬ ДЛЯ ВСЕХ (можешь поменять)
+GLOBAL_PASSWORD = "10и"  # ОБЩИЙ ПАРОЛЬ ДЛЯ ВСЕХ
 
 CLASS_LIST = [
     "Акимова Ксения Владимировна",
@@ -104,7 +104,6 @@ def get_db():
 
 def log_action(tg_id, name, action):
     conn = get_db()
-    # Используем московское время для логов
     moscow_time = datetime.now() + timedelta(hours=3)
     conn.execute("INSERT INTO logs (tg_id, name, action, timestamp) VALUES (?, ?, ?, ?)",
                  (tg_id, name, action, moscow_time.strftime('%d.%m.%Y %H:%M:%S')))
@@ -115,7 +114,7 @@ def is_admin(user_id):
     return user_id in ADMINS
 
 def get_week_dates_keyboard():
-    today = datetime.now() + timedelta(hours=3) # Учитываем смещение для дат
+    today = datetime.now() + timedelta(hours=3)
     monday = today - timedelta(days=today.weekday())
     sunday = monday + timedelta(days=6)
     dates = []
@@ -187,7 +186,6 @@ async def cmd_start(message: Message, state: FSMContext):
     conn.close()
     
     if user or teacher:
-        # Если уже зарегистрирован - пускаем сразу
         if user:
             log_action(message.from_user.id, user[1], "Вход в бота")
             await show_menu(message)
@@ -195,7 +193,6 @@ async def cmd_start(message: Message, state: FSMContext):
             log_action(message.from_user.id, teacher[1], "Вход учителя")
             await show_teacher_menu(message)
     else:
-        # Если новый - просим общий пароль
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="🔐 Войти в систему", callback_data="enter_global_pass")]
         ])
@@ -354,6 +351,7 @@ async def show_menu(message: Message):
         [InlineKeyboardButton(text="➕ Добавить мероприятие", callback_data="add_event")],
         [InlineKeyboardButton(text="📋 Мои мероприятия", callback_data="week_events")],
         [InlineKeyboardButton(text="✏️ Изменить баланс", callback_data="edit_balance")],
+        [InlineKeyboardButton(text="🔄 Сбросить регистрацию", callback_data="reset_my_reg")], # Новая кнопка
     ]
     if is_admin(message.from_user.id):
         kb_rows.append([InlineKeyboardButton(text="📢 Рассылка всем", callback_data="broadcast")])
@@ -367,6 +365,7 @@ async def show_menu_direct(user_id):
         [InlineKeyboardButton(text="➕ Добавить мероприятие", callback_data="add_event")],
         [InlineKeyboardButton(text="📋 Мои мероприятия", callback_data="week_events")],
         [InlineKeyboardButton(text="✏️ Изменить баланс", callback_data="edit_balance")],
+        [InlineKeyboardButton(text="🔄 Сбросить регистрацию", callback_data="reset_my_reg")], # Новая кнопка
     ]
     if is_admin(user_id):
         kb_rows.append([InlineKeyboardButton(text="📢 Рассылка всем", callback_data="broadcast")])
@@ -382,6 +381,7 @@ async def show_teacher_menu(message: Message):
         [InlineKeyboardButton(text="📋 Список класса", callback_data="view_class")],
         [InlineKeyboardButton(text="📊 Статистика", callback_data="stats")],
         [InlineKeyboardButton(text="📜 Логи действий", callback_data="logs")],
+        [InlineKeyboardButton(text="🔄 Сбросить регистрацию", callback_data="reset_my_reg")], # Новая кнопка
     ])
     await message.answer("👨‍🏫 Панель учителя:", reply_markup=kb)
 
@@ -393,6 +393,7 @@ async def show_teacher_menu_direct(user_id):
         [InlineKeyboardButton(text="📋 Список класса", callback_data="view_class")],
         [InlineKeyboardButton(text="📊 Статистика", callback_data="stats")],
         [InlineKeyboardButton(text="📜 Логи действий", callback_data="logs")],
+        [InlineKeyboardButton(text="🔄 Сбросить регистрацию", callback_data="reset_my_reg")], # Новая кнопка
     ])
     await bot.send_message(user_id, "👨‍🏫 Панель учителя:", reply_markup=kb)
 
@@ -462,6 +463,34 @@ async def back_to_menu_from_admin(cb: CallbackQuery, state: FSMContext):
     if teacher: await show_teacher_menu_direct(cb.from_user.id)
     elif user: await show_menu_direct(cb.from_user.id)
     else: await bot.send_message(cb.from_user.id, "❌ Сначала /start")
+
+# ===== НОВАЯ ФУНКЦИЯ: СБРОС РЕГИСТРАЦИИ =====
+@router.callback_query(F.data == "reset_my_reg")
+async def reset_registration(cb: CallbackQuery, state: FSMContext):
+    await state.clear()
+    conn = get_db()
+    
+    # Удаляем из таблицы пользователей
+    user_deleted = conn.execute("DELETE FROM users WHERE tg_id=?", (cb.from_user.id,)).rowcount
+    # Удаляем все мероприятия этого пользователя
+    if user_deleted:
+        conn.execute("DELETE FROM events WHERE tg_id=?", (cb.from_user.id,))
+    
+    # Удаляем из таблицы учителей
+    teacher_deleted = conn.execute("DELETE FROM teachers WHERE tg_id=?", (cb.from_user.id,)).rowcount
+    
+    conn.commit()
+    conn.close()
+    
+    if user_deleted or teacher_deleted:
+        log_action(cb.from_user.id, "Пользователь", "Сбросил свою регистрацию")
+        await cb.message.answer("✅ Ваша регистрация успешно сброшена!\n\nТеперь вы можете зарегистрироваться заново.")
+        # Перенаправляем на начальный экран
+        await cmd_start(cb.message, state)
+    else:
+        await cb.message.answer("❌ Вы не были зарегистрированы.")
+    
+    await cb.answer()
 
 @router.callback_query(F.data == "edit_balance")
 async def edit_balance_start(cb: CallbackQuery, state: FSMContext):
