@@ -1,3 +1,4 @@
+import os
 import asyncio
 import logging
 import sqlite3
@@ -15,8 +16,8 @@ import openpyxl
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 from openpyxl.utils import get_column_letter
 
-TOKEN = "9025997763:AAFF_6hSgwzjk0NrLko3-xZNiBOVNtofYHc"
-OWNER_ID = 1739585715
+TOKEN = os.environ.get("BOT_TOKEN")
+OWNER_ID = int(os.environ.get("OWNER_ID", "1739585715"))
 
 CLASS_NAME = "10И"
 CLASS_TEACHER = "Семёнова Ольга Забировна"
